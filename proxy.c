@@ -5,6 +5,23 @@
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
+#define CACHE_SLOTS 10
+
+typedef struct {
+    int valid;
+    char uri[MAXLINE];
+    char data[MAX_OBJECT_SIZE];
+    int size;
+    unsigned long long timestamp;
+} cache_entry;
+
+static cache_entry cache[CACHE_SLOTS];
+
+static unsigned long long cache_clock = 0;
+
+/* All threads share the cache, so protect it with a mutex */
+static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr =
@@ -56,6 +73,70 @@ void parse_uri(const char *uri, char *hostname, char *port, char *path)
     }
 }
 
+int cache_get(const char *uri, char *data)
+{
+    int i;
+    int size = -1;
+
+    pthread_mutex_lock(&cache_mutex);
+
+    for (i = 0; i < CACHE_SLOTS; i++) {
+        if (cache[i].valid &&
+            strcmp(cache[i].uri, uri) == 0) {
+
+            memcpy(data, cache[i].data, cache[i].size);
+            size = cache[i].size;
+
+            cache[i].timestamp = ++cache_clock;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&cache_mutex);
+
+    return size;
+}
+
+void cache_put(const char *uri, const char *data, int size)
+{
+    int i;
+    int victim = -1;
+
+    if (size > MAX_OBJECT_SIZE) {
+        return;
+    }
+
+    pthread_mutex_lock(&cache_mutex);
+
+    /* First look for an empty slot */
+    for (i = 0; i < CACHE_SLOTS; i++) {
+        if (!cache[i].valid) {
+            victim = i;
+            break;
+        }
+    }
+
+    /* No empty slot: evict the least recently used object */
+    if (victim == -1) {
+        victim = 0;
+
+        for (i = 1; i < CACHE_SLOTS; i++) {
+            if (cache[i].timestamp < cache[victim].timestamp) {
+                victim = i;
+            }
+        }
+    }
+
+    strcpy(cache[victim].uri, uri);
+    memcpy(cache[victim].data, data, size);
+
+    cache[victim].size = size;
+    cache[victim].valid = 1;
+    cache[victim].timestamp = ++cache_clock;
+
+    pthread_mutex_unlock(&cache_mutex);
+}
+
 
 /* Handle one client connection */
 void handle_client(int connfd)
@@ -77,6 +158,13 @@ void handle_client(int connfd)
     char path[MAXLINE];
 
     ssize_t n;
+    char cached_data[MAX_OBJECT_SIZE];
+    char object_data[MAX_OBJECT_SIZE];
+
+    int cached_size;
+    int object_size = 0;
+    int can_cache = 1;
+
 
     /* Read request line from client */
     Rio_readinitb(&rio, connfd);
@@ -109,6 +197,20 @@ void handle_client(int connfd)
         }
     }
 
+    /* Check whether this object is already cached */
+    cached_size = cache_get(uri, cached_data);
+
+    if (cached_size >= 0) {
+        printf("Cache hit: %s\n", uri);
+
+        Rio_writen(connfd, cached_data, cached_size);
+
+        return;
+    }
+
+    printf("Cache miss: %s\n", uri);
+
+
     /* Connect to the real web server */
     serverfd = Open_clientfd(hostname, port);
 
@@ -133,7 +235,24 @@ void handle_client(int connfd)
     Rio_readinitb(&server_rio, serverfd);
 
     while ((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
+
+        /* Send the response to the client as usual */
         Rio_writen(connfd, buf, n);
+
+        /* At the same time, save a copy if it is small enough */
+        if (can_cache) {
+            if (object_size + n <= MAX_OBJECT_SIZE) {
+                memcpy(object_data + object_size, buf, n);
+                object_size += n;
+            } else {
+                can_cache = 0;
+            }
+        }
+    }
+
+    if (can_cache) {
+    cache_put(uri, object_data, object_size);
+    printf("Cached: %s (%d bytes)\n", uri, object_size);
     }
 
     Close(serverfd);
