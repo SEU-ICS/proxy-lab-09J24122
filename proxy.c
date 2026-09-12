@@ -7,7 +7,12 @@
 #define MAX_OBJECT_SIZE 102400
 
 /* You won't lose style points for including this long line in your code */
-static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+static const char *user_agent_hdr =
+    "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) "
+    "Gecko/20120305 Firefox/10.0.3\r\n";
+
+
+/* Parse a URI into hostname, port, and path */
 void parse_uri(const char *uri, char *hostname, char *port, char *path)
 {
     const char *host_start;
@@ -52,27 +57,113 @@ void parse_uri(const char *uri, char *hostname, char *port, char *path)
 }
 
 
-int main(int argc, char **argv)
+/* Handle one client connection */
+void handle_client(int connfd)
 {
-    int listenfd;
-    int connfd;
     int serverfd;
-    socklen_t clientlen;
-    struct sockaddr_storage clientaddr;
+
     rio_t rio;
-    char buf[MAXLINE];
     rio_t server_rio;
-    char request[MAXLINE];
-    ssize_t n;
+
+    char buf[MAXLINE];
+    char request[MAXLINE * 4];
+
     char method[MAXLINE];
     char uri[MAXLINE];
     char version[MAXLINE];
+
     char hostname[MAXLINE];
     char port[16];
     char path[MAXLINE];
 
+    ssize_t n;
+
+    /* Read request line from client */
+    Rio_readinitb(&rio, connfd);
+
+    if (Rio_readlineb(&rio, buf, MAXLINE) <= 0) {
+        return;
+    }
+
+    printf("Request line: %s", buf);
+
+    sscanf(buf, "%s %s %s", method, uri, version);
+
+    printf("Method: %s\n", method);
+    printf("URI: %s\n", uri);
+    printf("Version: %s\n", version);
+
+    /* Parse URI */
+    parse_uri(uri, hostname, port, path);
+
+    printf("Hostname: %s\n", hostname);
+    printf("Port: %s\n", port);
+    printf("Path: %s\n", path);
+
+    /* Read and discard the rest of the client's headers */
+    while (Rio_readlineb(&rio, buf, MAXLINE) > 0) {
+        printf("Header: %s", buf);
+
+        if (strcmp(buf, "\r\n") == 0) {
+            break;
+        }
+    }
+
+    /* Connect to the real web server */
+    serverfd = Open_clientfd(hostname, port);
+
+    printf("Connected to server %s:%s\n", hostname, port);
+
+    /* Build a new HTTP request */
+    snprintf(request, sizeof(request),
+             "GET %s HTTP/1.0\r\n"
+             "Host: %s:%s\r\n"
+             "%s"
+             "Connection: close\r\n"
+             "Proxy-Connection: close\r\n"
+             "\r\n",
+             path, hostname, port, user_agent_hdr);
+
+    printf("Sending request to server:\n%s", request);
+
+    /* Send request to server */
+    Rio_writen(serverfd, request, strlen(request));
+
+    /* Read response from server and forward it to the client */
+    Rio_readinitb(&server_rio, serverfd);
+
+    while ((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
+        Rio_writen(connfd, buf, n);
+    }
+
+    Close(serverfd);
+}
+
+void *thread(void *vargp)
+{
+    int connfd = *((int *)vargp);
+
+    free(vargp);
+
+    /* This thread does not need to be joined later */
+    Pthread_detach(Pthread_self());
+
+    handle_client(connfd);
+
+    Close(connfd);
+
+    return NULL;
+}
 
 
+int main(int argc, char **argv)
+{
+    int listenfd;
+    int *connfdp;
+    pthread_t tid;
+
+    socklen_t clientlen;
+    struct sockaddr_storage clientaddr;
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
@@ -84,71 +175,18 @@ int main(int argc, char **argv)
     printf("Proxy listening on port %s\n", argv[1]);
 
     while (1) {
-    clientlen = sizeof(clientaddr);
+        clientlen = sizeof(clientaddr);
 
-    connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        connfdp = Malloc(sizeof(int));
 
-    printf("Accepted a connection\n");
+        *connfdp = Accept(listenfd,
+                          (SA *)&clientaddr,
+                          &clientlen);
 
-    Rio_readinitb(&rio, connfd);
+        printf("Accepted a connection\n");
 
-    if (Rio_readlineb(&rio, buf, MAXLINE) > 0) {
-        printf("Request line: %s", buf);
-
-        sscanf(buf, "%s %s %s", method, uri, version);
-
-        printf("Method: %s\n", method);
-        printf("URI: %s\n", uri);
-        printf("Version: %s\n", version);
-        parse_uri(uri, hostname, port, path);
-
-        printf("Hostname: %s\n", hostname);
-        printf("Port: %s\n", port);
-        printf("Path: %s\n", path);
-
+        Pthread_create(&tid, NULL, thread, connfdp);
     }
-
-
-    while (Rio_readlineb(&rio, buf, MAXLINE) > 0) {
-    printf("Header: %s", buf);
-
-    if (strcmp(buf, "\r\n") == 0) {
-        break;
-        }
-    }
-
-    serverfd = Open_clientfd(hostname, port);
-
-    printf("Connected to server %s:%s\n", hostname, port);
-
-    /* Build a new HTTP request for the real web server */
-    snprintf(request, MAXLINE,
-         "GET %s HTTP/1.0\r\n"
-         "Host: %s:%s\r\n"
-         "%s"
-         "Connection: close\r\n"
-         "Proxy-Connection: close\r\n"
-         "\r\n",
-         path, hostname, port, user_agent_hdr);
-
-    printf("Sending request to server:\n%s", request);
-
-    /* Send request to Tiny */
-    Rio_writen(serverfd, request, strlen(request));
-
-    /* Read Tiny's response and send it back to curl */
-    Rio_readinitb(&server_rio, serverfd);
-
-    while ((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
-        Rio_writen(connfd, buf, n);
-    }
-
-    Close(serverfd);
-    Close(connfd);
-
-    }
-
 
     return 0;
 }
-
